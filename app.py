@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import base64
 import os
@@ -14,12 +14,11 @@ GITHUB_USER = os.getenv("GITHUB_USER")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 STUDENT_SECRET = os.getenv("STUDENT_SECRET")
 
-# Init OpenAI client
+# Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
-
 app = FastAPI()
 
-# Pydantic models
+# Models
 class Attachment(BaseModel):
     name: str
     url: str
@@ -35,7 +34,7 @@ class TaskRequest(BaseModel):
     evaluation_url: str
     attachments: list[Attachment]
 
-# OpenAI helper
+# GPT Call
 def call_llm(prompt):
     response = client.chat.completions.create(
         model="gpt-4",
@@ -48,61 +47,52 @@ async def handle_task(task: TaskRequest):
     if task.secret != STUDENT_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    # Folder for repo
     repo_name = task.task
     folder = f"./repos/{repo_name}"
     os.makedirs(folder, exist_ok=True)
-
-    print(f"🚀 Starting task: {repo_name}")
 
     # Save attachments
     for att in task.attachments:
         if att.url.startswith("data:"):
             content = base64.b64decode(att.url.split(",", 1)[1])
-            file_path = os.path.join(folder, att.name)
-            with open(file_path, "wb") as f:
+            with open(os.path.join(folder, att.name), "wb") as f:
                 f.write(content)
-            print(f"📎 Saved attachment: {file_path}")
 
-    # Generate index.html using GPT
+    # Generate web code
     generated_code = call_llm(task.brief)
     with open(os.path.join(folder, "index.html"), "w") as f:
         f.write(generated_code)
-    print("✨ index.html generated from LLM")
 
-    # Add README and LICENSE
+    # README + LICENSE
     with open(os.path.join(folder, "README.md"), "w") as f:
         f.write(f"# {repo_name}\n\n{task.brief}\n\n## Checks\n" + "\n".join(f"- {c}" for c in task.checks) + "\n\n## License\nMIT\n")
     with open(os.path.join(folder, "LICENSE"), "w") as f:
         f.write("MIT License\n\nPermission is hereby granted...")
-    print("📄 README.md and LICENSE created")
 
-    # Git setup
+    # Git init and commit
     subprocess.run(["git", "init"], cwd=folder)
     subprocess.run(["git", "config", "user.name", GITHUB_USER], cwd=folder)
     subprocess.run(["git", "config", "user.email", f"{GITHUB_USER}@example.com"], cwd=folder)
     subprocess.run(["git", "add", "."], cwd=folder)
-    subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=folder)
-    print("✅ Git repo initialized and committed")
+    subprocess.run(["git", "commit", "-m", f"Round {task.round} commit"], cwd=folder)
 
-    # Create GitHub repo
+    # Create repo (skip if exists)
     response = requests.post(
         "https://api.github.com/user/repos",
         headers={"Authorization": f"token {GITHUB_TOKEN}"},
         json={"name": repo_name, "private": False}
     )
-    print(f"🔍 GitHub repo creation response: {response.status_code} {response.text}")
 
-    if response.status_code >= 300:
-        raise HTTPException(status_code=500, detail=f"GitHub repo creation failed: {response.text}")
+    if response.status_code == 422 and "name already exists" in response.text:
+        print("Repo already exists. Using existing repo.")
+    elif response.status_code >= 300:
+        raise HTTPException(status_code=500, detail="GitHub repo creation failed")
 
-    # Push using token in remote URL
+    # Push to GitHub
     push_url = f"https://{GITHUB_USER}:{GITHUB_TOKEN}@github.com/{GITHUB_USER}/{repo_name}.git"
     subprocess.run(["git", "remote", "add", "origin", push_url], cwd=folder)
     subprocess.run(["git", "branch", "-M", "main"], cwd=folder)
-    result = subprocess.run(["git", "push", "-u", "origin", "main"], cwd=folder, capture_output=True, text=True)
-    print(f"⬆️ Git push stdout: {result.stdout}")
-    print(f"⚠️ Git push stderr: {result.stderr}")
+    subprocess.run(["git", "push", "-u", "origin", "main"], cwd=folder)
 
     # Enable GitHub Pages
     pages_api = f"https://api.github.com/repos/{GITHUB_USER}/{repo_name}/pages"
@@ -111,12 +101,10 @@ async def handle_task(task: TaskRequest):
         headers={"Authorization": f"token {GITHUB_TOKEN}"},
         json={"source": {"branch": "main", "path": "/"}}
     )
-    print(f"🌍 GitHub Pages response: {r.status_code} {r.text}")
+    if r.status_code >= 300 and "already exists" not in r.text:
+        raise HTTPException(status_code=500, detail="GitHub Pages setup failed")
 
-    if r.status_code >= 300:
-        raise HTTPException(status_code=500, detail=f"GitHub Pages setup failed: {r.text}")
-
-    # Final data
+    # Final details
     commit_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=folder).decode().strip()
     pages_url = f"https://{GITHUB_USER}.github.io/{repo_name}/"
 
@@ -132,10 +120,7 @@ async def handle_task(task: TaskRequest):
     }
 
     notify_resp = requests.post(task.evaluation_url, headers={"Content-Type": "application/json"}, json=notify_data)
-    print(f"📡 Evaluation URL response: {notify_resp.status_code} {notify_resp.text}")
-
     if notify_resp.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Evaluation notification failed: {notify_resp.text}")
+        raise HTTPException(status_code=500, detail="Evaluation notification failed")
 
-    print("✅ Task completed successfully")
     return {"status": "done", "pages_url": pages_url}
