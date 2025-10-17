@@ -140,7 +140,7 @@ async def handle_task(task: TaskRequest):
     notify_resp = requests.post(task.evaluation_url, headers={"Content-Type": "application/json"}, json=notify_data)
     print(f"📬 Evaluation response: {notify_resp.status_code} {notify_resp.text}")
 
-    if notify_resp.status_code != 200:
+    if  not notify_resp.ok:
         print("❌ Evaluation system notification failed.")
         raise HTTPException(status_code=500, detail="Evaluation notification failed")
 
