@@ -1,10 +1,9 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import base64
 import os
 import requests
 import subprocess
-import csv
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -15,12 +14,9 @@ GITHUB_USER = os.getenv("GITHUB_USER")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 STUDENT_SECRET = os.getenv("STUDENT_SECRET")
 
-# Init OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
-
 app = FastAPI()
 
-# Pydantic models
 class Attachment(BaseModel):
     name: str
     url: str
@@ -36,108 +32,116 @@ class TaskRequest(BaseModel):
     evaluation_url: str
     attachments: list[Attachment]
 
-# OpenAI helper
 def call_llm(prompt):
+    print("📨 Calling OpenAI with prompt...")
+    detailed_prompt = f"""
+        You're a professional frontend developer. Build a **minimal, working HTML/JS** web application **strictly** based on this task brief:
+
+        \"\"\"
+        {prompt}
+        \"\"\"
+
+        ✅ Ensure:
+        - All required HTML elements and IDs/classes are present.
+        - All logic runs in plain JavaScript (no frameworks unless stated).
+        - Only include essential code.
+        - Match expected output exactly (text, structure, casing).
+        - If attachments are mentioned, read them via fetch with proper MIME type and process them.
+        - Load required external libraries via CDN if requested.
+
+        ⚠ DO NOT include explanations, markdown, or extra text—ONLY return the raw code (HTML+JS).
+    """.strip()
+
     response = client.chat.completions.create(
         model="gpt-4",
-        messages=[{"role": "user", "content": f"Create a minimal HTML/JS web app based on this brief: {prompt}"}]
+        messages=[{"role": "user", "content": detailed_prompt}]
     )
+    print("✅ LLM Response received.")
     return response.choices[0].message.content
 
 @app.post("/api")
 async def handle_task(task: TaskRequest):
+    print(f"📥 Received task: {task.task} (Round {task.round})")
+
     if task.secret != STUDENT_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    repo_name = task.task
-    folder = f"./repos/{repo_name}"
+    folder = f"./repos/{task.task}"
     os.makedirs(folder, exist_ok=True)
+    print(f"📁 Created folder: {folder}")
 
     for att in task.attachments:
         if att.url.startswith("data:"):
+            print(f"📎 Saving attachment: {att.name}")
             content = base64.b64decode(att.url.split(",", 1)[1])
             with open(os.path.join(folder, att.name), "wb") as f:
                 f.write(content)
 
-    # Compute total sales if data.csv exists
-    sum_sales = None
-    csv_path = os.path.join(folder, "data.csv")
-    if os.path.exists(csv_path):
-        sum_sales = 0.0
-        with open(csv_path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                sum_sales += float(row.get("sales", 0))
-        print("✅ Computed sum_sales:", sum_sales)
-
-    prompt = task.brief
-    if sum_sales is not None:
-        prompt += f"\nThe total sales is {sum_sales}. Use this value in computing and verifying."
-
-    generated_code = call_llm(prompt)
+    print("⚙ Generating HTML/JS from LLM...")
+    code = call_llm(task.brief)
     with open(os.path.join(folder, "index.html"), "w") as f:
-        f.write(generated_code)
+        f.write(code)
 
     with open(os.path.join(folder, "README.md"), "w") as f:
-        f.write(f"# {repo_name}\n\n{task.brief}\n\n## Checks\n" + "\n".join(f"- {c}" for c in task.checks) + "\n\n## License\nMIT\n")
+        f.write(f"# {task.task}\n\n{task.brief}\n\n## Checks\n" + "\n".join(f"- {c}" for c in task.checks) + "\n\n## License\nMIT\n")
     with open(os.path.join(folder, "LICENSE"), "w") as f:
         f.write("MIT License\n\nPermission is hereby granted...")
 
+    print("🔧 Initializing Git repository...")
     subprocess.run(["git", "init"], cwd=folder)
     subprocess.run(["git", "config", "user.name", GITHUB_USER], cwd=folder)
     subprocess.run(["git", "config", "user.email", f"{GITHUB_USER}@example.com"], cwd=folder)
     subprocess.run(["git", "add", "."], cwd=folder)
-    commit_msg = f"Round {task.round} commit"
-    subprocess.run(["git", "commit", "-m", commit_msg], cwd=folder)
+    subprocess.run(["git", "commit", "-m", f"Round {task.round} commit"], cwd=folder)
 
-    # Create GitHub repo if not exists
+    print("📡 Creating GitHub repo...")
     response = requests.post(
         "https://api.github.com/user/repos",
         headers={"Authorization": f"token {GITHUB_TOKEN}"},
-        json={"name": repo_name, "private": False}
+        json={"name": task.task, "private": False}
     )
+    print(f"🔍 Repo creation response: {response.status_code} {response.text}")
+
     if response.status_code == 422 and "name already exists" in response.text:
-        print("Repo already exists. Using existing repo.")
+        print("⚠ Repo already exists. Continuing with update.")
     elif response.status_code >= 300:
         raise HTTPException(status_code=500, detail="GitHub repo creation failed")
 
-    push_url = f"https://{GITHUB_USER}:{GITHUB_TOKEN}@github.com/{GITHUB_USER}/{repo_name}.git"
-    result = subprocess.run(["git", "remote"], cwd=folder, capture_output=True, text=True)
-    if "origin" not in result.stdout:
-        subprocess.run(["git", "remote", "add", "origin", push_url], cwd=folder)
+    print("🚀 Pushing to GitHub...")
+    push_url = f"https://{GITHUB_USER}:{GITHUB_TOKEN}@github.com/{GITHUB_USER}/{task.task}.git"
+    subprocess.run(["git", "remote", "add", "origin", push_url], cwd=folder, stderr=subprocess.DEVNULL)
     subprocess.run(["git", "branch", "-M", "main"], cwd=folder)
+    subprocess.run(["git", "push", "-u", "origin", "main"], cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    push = subprocess.run(["git", "push", "-u", "origin", "main"], cwd=folder, capture_output=True, text=True)
-    print("Push stdout:", push.stdout)
-    print("Push stderr:", push.stderr)
-    if push.returncode != 0:
-        raise HTTPException(status_code=500, detail=f"Git push failed: {push.stderr}")
-
-    pages_api = f"https://api.github.com/repos/{GITHUB_USER}/{repo_name}/pages"
+    print("🌐 Enabling GitHub Pages...")
+    pages_api = f"https://api.github.com/repos/{GITHUB_USER}/{task.task}/pages"
     r = requests.post(
         pages_api,
         headers={"Authorization": f"token {GITHUB_TOKEN}"},
         json={"source": {"branch": "main", "path": "/"}}
     )
-    print("Pages response:", r.status_code, r.text)
-    if r.status_code >= 300 and "already exists" not in r.text:
-        raise HTTPException(status_code=500, detail="GitHub Pages setup failed")
+    print(f"📄 Pages response: {r.status_code} {r.text}")
+    if r.status_code >= 300 and "already enabled" not in r.text.lower():
+        raise HTTPException(status_code=500, detail=f"GitHub Pages setup failed: {r.text}")
 
     commit_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=folder).decode().strip()
-    pages_url = f"https://{GITHUB_USER}.github.io/{repo_name}/"
+    pages_url = f"https://{GITHUB_USER}.github.io/{task.task}/"
 
+    print("📤 Notifying evaluation system...")
     notify_data = {
         "email": task.email,
         "task": task.task,
         "round": task.round,
         "nonce": task.nonce,
-        "repo_url": f"https://github.com/{GITHUB_USER}/{repo_name}",
+        "repo_url": f"https://github.com/{GITHUB_USER}/{task.task}",
         "commit_sha": commit_sha,
         "pages_url": pages_url
     }
-
     notify_resp = requests.post(task.evaluation_url, headers={"Content-Type": "application/json"}, json=notify_data)
+    print(f"📬 Evaluation response: {notify_resp.status_code} {notify_resp.text}")
+
     if notify_resp.status_code != 200:
+        print("❌ Evaluation system notification failed.")
         raise HTTPException(status_code=500, detail="Evaluation notification failed")
 
     return {"status": "done", "pages_url": pages_url}
